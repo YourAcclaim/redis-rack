@@ -1,0 +1,22 @@
+services:
+  redis-rack:
+    stdin_open: true
+    build:
+      dockerfile: Dockerfile
+      context: .
+    depends_on:
+      - redis
+    environment:
+      REDIS_URL: redis://redis:6379
+    logging: &default-logging-options
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    volumes:
+      - .:/app
+
+  redis:
+    image: public.ecr.aws/docker/library/redis:6
+    logging:
+      <<: *default-logging-options

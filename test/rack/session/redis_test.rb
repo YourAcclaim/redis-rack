@@ -91,7 +91,7 @@ describe Rack::Session::Redis do
   end
 
   it "does not store a blank session" do
-    session_store = Rack::Session::Redis.new(incrementor)
+    session_store = Rack::Session::Redis.new(incrementor, { redis_server: ENV["REDIS_URL"] }.compact)
     sid = session_store.generate_unique_sid({})
     session_store.with { |c| c.get(sid.private_id).must_be_nil }
   end
@@ -309,6 +309,44 @@ describe Rack::Session::Redis do
     end
   end
 
+  it "doesn't write to session after session is deleted if prevent_write_after_delete" do
+    @mutex = Mutex.new
+    app = proc do |env|
+      session = env['rack.session']
+      session.keys
+      case env['REQUEST_METHOD']
+      when 'DELETE'
+        sleep 0.1
+        session.destroy
+      when 'POST'
+        sleep 0.4
+        session['counter'] ||= 0
+        session['counter'] += 1
+      else
+        # no-op
+      end
+      [200, {}, [session.inspect]]
+    end
+    pool = prevent_write_after_delete(app)
+    req = Rack::MockRequest.new(pool)
+
+    res = req.post('/')
+    res.body.must_equal('{"counter"=>1}')
+    cookie = res["Set-Cookie"]
+
+    delete = Thread.new do
+      req.delete('/', "HTTP_COOKIE" => cookie)
+    end
+
+    recreate = Thread.new do
+      req.post('/', "HTTP_COOKIE" => cookie)
+    end
+    recreate_res, delete_res = [delete, recreate].map(&:run).reverse.map { |t| t.join.value }
+
+    res = req.get('/', "HTTP_COOKIE" => cookie)
+    res.body.must_equal('{}')
+  end
+
   # anyone know how to do this better?
   it "cleanly merges sessions when multithreaded" do
     unless $DEBUG
@@ -396,19 +434,26 @@ describe Rack::Session::Redis do
       yield simple(*args)
       yield pooled(*args)
       yield external_pooled(*args)
+      yield prevent_write_after_delete(*args)
     end
 
     def simple(app, options = {})
-      Rack::Session::Redis.new(app, options)
+      options = options.merge(redis_server: ENV["REDIS_URL"]) if !options.key?(:redis_server) && ENV["REDIS_URL"]
+      Rack::Session::Redis.new(app, options.merge(threadsafe: true))
     end
 
     def pooled(app, options = {})
+      options = options.merge(redis_server: ENV["REDIS_URL"]) if !options.key?(:redis_server) && ENV["REDIS_URL"]
       Rack::Session::Redis.new(app, options)
       Rack::Session::Redis.new(app, options.merge(pool_size: 5, pool_timeout: 10))
     end
 
     def external_pooled(app, options = {})
-      Rack::Session::Redis.new(app, options.merge(pool: ::ConnectionPool.new(size: 1, timeout: 1) { ::Redis::Store::Factory.create("redis://127.0.0.1:6380/1") }))
+      Rack::Session::Redis.new(app, options.merge(pool: ::ConnectionPool.new(size: 1, timeout: 1) { ::Redis::Store::Factory.create(ENV["REDIS_URL"] || "redis://127.0.0.1:6380/1") }))
     end
 
+    def prevent_write_after_delete(app, options = {})
+      options = options.merge(redis_server: ENV["REDIS_URL"]) if !options.key?(:redis_server) && ENV["REDIS_URL"]
+      Rack::Session::Redis.new(app, options.merge(prevent_write_after_delete: true))
+    end
 end

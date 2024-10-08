@@ -46,7 +46,22 @@ module Rack
 
       def write_session(req, sid, new_session, options = {})
         with_lock(req, false) do
-          with { |c| c.set(sid.private_id, new_session, options.to_hash) }
+          with do |c|
+            if prevent_write_after_delete?
+              c.watch(sid.private_id) do
+                existing_value = c.get(sid.private_id)
+                if existing_value != session_tombstone
+                  c.multi do |multi|
+                    multi.set(sid.private_id, Marshal.dump(wrap_session(new_session)))
+                  end
+                else
+                  c.unwatch
+                end
+              end
+            else
+              c.set(sid.private_id, new_session, options.to_hash)
+            end
+          end
           sid
         end
       end
@@ -54,11 +69,40 @@ module Rack
       def delete_session(req, sid, options)
         with_lock(req) do
           with do |c|
-            c.del(sid.public_id)
-            c.del(sid.private_id)
+            if prevent_write_after_delete?
+              c.del(sid.public_id)
+              c.set(sid.private_id, session_tombstone, px: tombstone_expire)
+            else
+              c.del(sid.public_id)
+              c.del(sid.private_id)
+            end
           end
           generate_sid unless options[:drop]
         end
+      end
+
+      def session_tombstone
+        {"__deleted" => true}
+      end
+
+      def wrap_session(session)
+        {"__deleted" => false, "session" => session}
+      end
+
+      def unwrap_session(session)
+        if session.is_a?(Hash) && session.key?("__deleted")
+          session["session"]
+        else
+          session
+        end
+      end
+
+      def prevent_write_after_delete?
+        @default_options.fetch(:prevent_write_after_delete, false)
+      end
+
+      def tombstone_expire
+        @default_options.fetch(:tombstone_expire, 60 * 1_000)
       end
 
       def threadsafe?
@@ -85,7 +129,13 @@ module Rack
       private
 
       def get_session_with_fallback(sid)
-        with { |c| c.get(sid.private_id) || c.get(sid.public_id) }
+        with do |c|
+          if prevent_write_after_delete?
+            unwrap_session(c.get(sid.private_id))
+          else
+            c.get(sid.private_id) || c.get(sid.public_id)
+          end
+        end
       end
     end
   end
